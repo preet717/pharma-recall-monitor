@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 import requests
+from urllib.parse import quote
 
 from src.config import CHECKPOINT_FILE, EndpointConfig, RAW_DATA_DIR
 
@@ -149,21 +150,88 @@ class OpenFDAExtractor:
 
         return all_records, self.telemetry
 
-    def extract_contextual_adverse_events(self) -> List[Dict[str, Any]]:
-        """Extracts aggregated adverse event counts by manufacturer as contextual metadata."""
-        cache_path = RAW_DATA_DIR / f"{self.config.domain}_adverse_events_counts.json"
-        url = (
-            f"{self.config.adverse_event_url}"
-            f"?search=receivedate:[{self.config.start_date}+TO+{self.config.end_date}]"
-            f"&count=patient.drug.openfda.manufacturer_name.exact&limit=1000"
-        )
-        try:
-            payload = self._request_with_backoff(url)
-            results = payload.get("results", [])
-            cache_path.write_text(json.dumps({"results": results}, indent=2), encoding="utf-8")
-            return results
-        except Exception as exc:
-            logger.warning("Contextual adverse event fetch failed (%s). Checking cache.", exc)
-            if cache_path.exists():
-                return json.loads(cache_path.read_text(encoding="utf-8")).get("results", [])
+    def extract_contextual_adverse_events(
+            self, raw_recalls: List[Dict[str, Any]] | None = None
+        ) -> List[Dict[str, Any]]:
+            """
+            Extracts 3-year aggregated adverse event counts by manufacturer.
+            Combines the global top-999 query with targeted batched queries for any
+            FDA-registered recalling manufacturer outside the global top 999.
+            """
+
+            cache_path = RAW_DATA_DIR / f"{self.config.domain}_adverse_events_counts.json"
+            base_url = (
+                f"{self.config.adverse_event_url}"
+                f"?search=receivedate:[{self.config.start_date}+TO+{self.config.end_date}]"
+                f"&count=patient.drug.openfda.manufacturer_name.exact&limit=999"
+            )
+            try:
+                payload = self._request_with_backoff(base_url)
+                merged_counts: Dict[str, int] = {
+                    item["term"]: int(item["count"])
+                    for item in payload.get("results", [])
+                    if "term" in item
+                }
+
+                # Identify FDA-registered manufacturers in our recall dataset missed by the global top-999 cap
+                if raw_recalls:
+                    recall_mfrs = set()
+                    for r in raw_recalls:
+                        openfda = r.get("openfda") or {}
+                        for m_name in openfda.get("manufacturer_name") or []:
+                            if m_name and m_name.strip():
+                                recall_mfrs.add(m_name.strip())
+
+                    missing_mfrs = sorted(
+                        m for m in recall_mfrs
+                        if m.upper() not in {k.upper() for k in merged_counts}
+                    )
+
+                    # Fetch exact 3-year counts for remaining recalling manufacturers in batches of 20
+                    batch_size = 20
+                    for i in range(0, len(missing_mfrs), batch_size):
+                        batch = missing_mfrs[i : i + batch_size]
+                        quoted_terms = "+".join(f'"{quote(m)}"' for m in batch)
+                        targeted_url = (
+                            f"{self.config.adverse_event_url}"
+                            f"?search=receivedate:[{self.config.start_date}+TO+{self.config.end_date}]"
+                            f"+AND+patient.drug.openfda.manufacturer_name.exact:({quoted_terms})"
+                            f"&count=patient.drug.openfda.manufacturer_name.exact&limit=999"
+                        )
+                        batch_payload = self._request_with_backoff(targeted_url)
+                        for item in batch_payload.get("results", []):
+                            term = item.get("term")
+                            if term and term not in merged_counts:
+                                merged_counts[term] = int(item.get("count", 0))
+
+                results = [{"term": k, "count": v} for k, v in merged_counts.items()]
+                cache_path.write_text(json.dumps({"results": results}, indent=2), encoding="utf-8")
+                logger.info(
+                    "Fetched %d total 3-year manufacturer adverse event buckets (global + targeted recall firms)",
+                    len(results),
+                )
+                return results
+            except Exception as exc:
+                logger.warning("Contextual adverse event fetch failed (%s). Checking cache.", exc)
+                if cache_path.exists():
+                    return json.loads(cache_path.read_text(encoding="utf-8")).get("results", [])
             return []
+
+    # def extract_contextual_adverse_events(self) -> List[Dict[str, Any]]:
+    #     """Extracts aggregated adverse event counts by manufacturer as contextual metadata."""
+    #     cache_path = RAW_DATA_DIR / f"{self.config.domain}_adverse_events_counts.json"
+    #     url = (
+    #         f"{self.config.adverse_event_url}"
+    #         f"?search=receivedate:[{self.config.start_date}+TO+{self.config.end_date}]"
+    #         f"&count=patient.drug.openfda.manufacturer_name.exact&limit=999"
+    #     )
+    #     try:
+    #         payload = self._request_with_backoff(url)
+    #         results = payload.get("results", [])
+    #         cache_path.write_text(json.dumps({"results": results}, indent=2), encoding="utf-8")
+    #         return results
+    #     except Exception as exc:
+    #         logger.warning("Contextual adverse event fetch failed (%s). Checking cache.", exc)
+    #         if cache_path.exists():
+    #             return json.loads(cache_path.read_text(encoding="utf-8")).get("results", [])
+    #         return []

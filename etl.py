@@ -27,9 +27,12 @@ def run_pipeline(domain: str = "drug", incremental: bool = False) -> None:
     logger.info("Starting ETL run %s for domain='%s' (window %s to %s)", run_id, domain, config.start_date, config.end_date)
 
     # 1. Extract
+    # extractor = OpenFDAExtractor(config)
+    # raw_recalls, telemetry = extractor.extract_enforcement_recalls(incremental=incremental)
+    # ae_counts = extractor.extract_contextual_adverse_events()
     extractor = OpenFDAExtractor(config)
     raw_recalls, telemetry = extractor.extract_enforcement_recalls(incremental=incremental)
-    ae_counts = extractor.extract_contextual_adverse_events()
+    ae_counts = extractor.extract_contextual_adverse_events(raw_recalls=raw_recalls)
 
     # 2. Validate (PASS / WARN / QUARANTINE)
     validator = DataQualityValidator(run_id=run_id, run_timestamp=run_ts)

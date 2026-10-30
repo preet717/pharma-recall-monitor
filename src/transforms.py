@@ -10,20 +10,42 @@ from src.config import SEVERITY_WEIGHTS
 from src.validator import VALIDATOR_VERSION
 
 
+# def normalize_firm_name(name: Any) -> str:
+#     """Standardizes manufacturer names for deterministic entity resolution."""
+#     if not name or not str(name).strip():
+#         return "UNKNOWN MANUFACTURER"
+#     cleaned = str(name).upper().strip()
+#     cleaned = re.sub(r"[,\.\(\)]", " ", cleaned)
+#     cleaned = re.sub(
+#         r"\b(INC|INCORPORATED|LLC|LTD|LIMITED|CORP|CORPORATION|CO|COMPANY|PHARMACEUTICALS|PHARMA|LABS|LABORATORIES)\b",
+#         "",
+#         cleaned,
+#     )
+#     cleaned = re.sub(r"\s+", " ", cleaned).strip()
+#     return cleaned if cleaned else str(name).upper().strip()
+
 def normalize_firm_name(name: Any) -> str:
-    """Standardizes manufacturer names for deterministic entity resolution."""
+    """Standardizes manufacturer names across enforcement and FAERS endpoints."""
     if not name or not str(name).strip():
         return "UNKNOWN MANUFACTURER"
     cleaned = str(name).upper().strip()
-    cleaned = re.sub(r"[,\.\(\)]", " ", cleaned)
+    # Strip DBA clauses and parenthetical suffixes
+    cleaned = re.sub(r"\bDBA\b.*$", "", cleaned)
+    cleaned = re.sub(r"\([^)]*\)", " ", cleaned)
+    cleaned = re.sub(r"[,\.\-/]", " ", cleaned)
+    # Harmonize HEALTHCARE -> HEALTH (e.g., Cardinal Healthcare -> Cardinal Health)
+    cleaned = re.sub(r"\bHEALTHCARE\b", "HEALTH", cleaned)
     cleaned = re.sub(
-        r"\b(INC|INCORPORATED|LLC|LTD|LIMITED|CORP|CORPORATION|CO|COMPANY|PHARMACEUTICALS|PHARMA|LABS|LABORATORIES)\b",
+        r"\b(INC|INCORPORATED|LLC|LTD|LIMITED|CORP|CORPORATION|CO|COMPANY|"
+        r"PHARMACEUTICALS|PHARMACEUTICAL|PHARMA|LABS|LABORATORIES|LABORATORY|"
+        r"USA|US|INDIA|GLOBAL|HOLDINGS|ENTERPRISES|SERVICES|PACKAGING|INDUSTRIES)\b",
         "",
         cleaned,
     )
+    # Strip trailing plant/subsidiary numbers (e.g., CARDINAL HEALTH 107 -> CARDINAL HEALTH)
+    cleaned = re.sub(r"\s+\d+$", "", cleaned)
     cleaned = re.sub(r"\s+", " ", cleaned).strip()
     return cleaned if cleaned else str(name).upper().strip()
-
 
 def generate_firm_id(normalized_name: str) -> str:
     """Generates a deterministic 12-character primary key for a normalized firm."""
@@ -66,6 +88,8 @@ class RecallTransformer:
         generic_list = openfda.get("generic_name") or []
         route_list = openfda.get("route") or []
         ptype_list = openfda.get("product_type") or []
+        mfr_list = openfda.get("manufacturer_name") or []
+        openfda_mfr_clean = normalize_firm_name(mfr_list[0]) if mfr_list else "UNMAPPED"
 
         primary_ndc = ndc_list[0] if ndc_list else None
         primary_brand = brand_list[0].upper() if brand_list else None
@@ -105,6 +129,7 @@ class RecallTransformer:
             "reliable_product_key": reliable_product_key,
             "dq_status": r.get("dq_status", "PASS"),
             "dq_flags": r.get("dq_flags", "NONE"),
+            "openfda_mfr_clean": openfda_mfr_clean,
         }
 
         product_row = {
@@ -151,6 +176,13 @@ class RecallTransformer:
             )
 
             clean_name = grp["firm_name_clean"].iloc[0]
+            # Check primary firm name first, then fallback to mapped openfda.manufacturer_name
+            ae_total = ae_map.get(clean_name, 0)
+            if ae_total == 0 and "openfda_mfr_clean" in grp.columns:
+                for alt_name in grp["openfda_mfr_clean"].dropna().unique():
+                    if alt_name != "UNMAPPED" and alt_name in ae_map:
+                        ae_total += ae_map[alt_name]
+
             firm_groups.append(
                 {
                     "firm_id": firm_id,
@@ -168,7 +200,8 @@ class RecallTransformer:
                     "median_reporting_lag_days": float(grp["reporting_lag_days"].median())
                     if grp["reporting_lag_days"].notna().any()
                     else np.nan,
-                    "contextual_adverse_event_count": ae_map.get(clean_name, 0),
+                    # "contextual_adverse_event_count": ae_map.get(clean_name, 0),
+                    "contextual_adverse_event_count": ae_total,
                 }
             )
         return pd.DataFrame(firm_groups).sort_values("severity_weighted_score", ascending=False)
