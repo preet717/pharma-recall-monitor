@@ -23,8 +23,8 @@ This platform solves those challenges by:
 The project runs locally using the standard command flow below with zero external databases, Docker containers, or API keys required:
 
 ```bash
-git clone <repository-url>
-cd <repository-folder>
+git clone https://github.com/preet717/pharma-recall-monitor.git
+cd pharma-recall-monitor
 python -m venv .venv
 # Windows: .venv\Scripts\activate
 # macOS/Linux: source .venv/bin/activate

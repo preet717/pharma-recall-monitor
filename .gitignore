@@ -20,6 +20,7 @@ data/processed/*
 # Conversation exports
 ai_transcript/*
 !ai_transcript/.gitkeep
+!ai_transcript/ai_transcript.pdf
 
 # Local OS files
 Thumbs.db
