@@ -1,0 +1,14 @@
+Debugging exchange summary: empty fact table during quarantine reprocessing
+
+The fifth pipeline test quarantines its only sample record. Transforming the
+empty valid-record list therefore writes an empty fact_recalls.parquet file
+without columns. Reprocessing then attempted to read the recall_number column
+from that file and raised KeyError.
+
+The reprocessor now checks that the fact table is non-empty and contains the
+recall_number column before reading primary keys. Promotion to fact_recalls,
+dim_products, and the audit log also handles empty DataFrames without
+concatenating a 0-column table with a new row.
+
+The validator in this workspace is version v1.2.0; the offline reprocessor
+test confirms its inverted-date record is quarantined before remediation.

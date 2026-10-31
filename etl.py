@@ -7,6 +7,7 @@ import pandas as pd
 
 from src.config import ENDPOINT_REGISTRY, PROCESSED_DATA_DIR
 from src.extractor import OpenFDAExtractor
+from src.reprocessor import QuarantineReprocessor, replay_remediations
 from src.transforms import RecallTransformer
 from src.validator import DataQualityValidator
 
@@ -27,9 +28,6 @@ def run_pipeline(domain: str = "drug", incremental: bool = False) -> None:
     logger.info("Starting ETL run %s for domain='%s' (window %s to %s)", run_id, domain, config.start_date, config.end_date)
 
     # 1. Extract
-    # extractor = OpenFDAExtractor(config)
-    # raw_recalls, telemetry = extractor.extract_enforcement_recalls(incremental=incremental)
-    # ae_counts = extractor.extract_contextual_adverse_events()
     extractor = OpenFDAExtractor(config)
     raw_recalls, telemetry = extractor.extract_enforcement_recalls(incremental=incremental)
     ae_counts = extractor.extract_contextual_adverse_events(raw_recalls=raw_recalls)
@@ -37,6 +35,15 @@ def run_pipeline(domain: str = "drug", incremental: bool = False) -> None:
     # 2. Validate (PASS / WARN / QUARANTINE)
     validator = DataQualityValidator(run_id=run_id, run_timestamp=run_ts)
     valid_records, quarantined_df, dq_rules_df, dq_completeness_df, dq_metrics = validator.validate_raw_records(raw_recalls)
+
+    # 2b. Replay operator remediations from the audit log so a full rebuild does not discard them
+    remediations = QuarantineReprocessor().load_promoted_remediations()
+    valid_records, quarantined_df, replayed = replay_remediations(
+        valid_records, quarantined_df, remediations, validator
+    )
+    dq_metrics["records_remediated"] = replayed
+    if replayed:
+        logger.info("Replayed %d operator remediation(s) from the audit log", replayed)
 
     # 3. Transform into Star Schema
     transformer = RecallTransformer()
@@ -78,14 +85,25 @@ def run_pipeline(domain: str = "drug", incremental: bool = False) -> None:
     lineage_record.to_parquet(lineage_path, index=False)
 
     logger.info(
-        "ETL Complete | Extracted=%d | Passed=%d | Warned=%d | Quarantined=%d | Duplicates=%d | RefIntegrity=%s",
+        "ETL Complete | Extracted=%d | Passed=%d | Warned=%d | Quarantined=%d | Remediated=%d | Duplicates=%d "
+        "| Schema=%s | RefIntegrity=%s",
         dq_metrics["records_extracted"],
         dq_metrics["records_passed"],
         dq_metrics["records_warned"],
         dq_metrics["records_quarantined"],
+        dq_metrics["records_remediated"],
         dq_metrics["duplicate_count"],
+        dq_metrics["schema_consistency_passed"],
         ref_integrity["referential_integrity_passed"],
     )
+    if not dq_metrics["schema_consistency_passed"]:
+        logger.warning(
+            "Schema drift detected | missing keys=%s | wrong types=%s",
+            dq_metrics["schema_missing_key_fields"],
+            dq_metrics["schema_wrong_type_fields"],
+        )
+    if not ref_integrity["referential_integrity_passed"]:
+        logger.error("Referential integrity failed: %s", ref_integrity)
 
 
 if __name__ == "__main__":

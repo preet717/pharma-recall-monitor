@@ -6,15 +6,18 @@ without making external API calls. Never overwrites original quarantine records.
 """
 from datetime import datetime, timezone
 import json
+import logging
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional, Tuple
 import uuid
 import pandas as pd
 
 from src.classifier import KeywordRuleClassifier
 from src.config import PROCESSED_DATA_DIR, RAW_DATA_DIR
 from src.transforms import RecallTransformer
-from src.validator import DataQualityValidator, VALIDATOR_VERSION
+from src.validator import DataQualityValidator, VALIDATOR_VERSION, record_fingerprint
+
+logger = logging.getLogger(__name__)
 
 
 class QuarantineReprocessor:
@@ -37,6 +40,7 @@ class QuarantineReprocessor:
             columns=[
                 "attempt_id",
                 "quarantine_id",
+                "record_fingerprint",
                 "original_recall_number",
                 "effective_recall_number",
                 "reprocessed_at",
@@ -88,15 +92,13 @@ class QuarantineReprocessor:
                 base_key = rec_num or f"EVT-{candidate_payload.get('event_id', 'UNK')}"
                 candidate_payload["recall_number"] = f"{base_key}-R{q_row['record_index']}"
 
-            # 2. Align inverted recall_initiation_date with report_date
+            # 2. Clear an inverted/implausible recall_initiation_date rather than inventing one:
+            #    the record is retained with WARN_MISSING_INITIATION_DATE and no reporting lag.
             if "CRITICAL_CHRONOLOGICAL_INVERSION" in str(q_row["quarantine_reasons"]):
-                rep_dt = candidate_payload.get("report_date")
-                if rep_dt:
-                    candidate_payload["recall_initiation_date"] = rep_dt
+                candidate_payload["recall_initiation_date"] = ""
 
-            # 3. Default missing/invalid classification to Class II (standard moderate hazard)
-            if "CRITICAL_INVALID_CLASSIFICATION" in str(q_row["quarantine_reasons"]):
-                candidate_payload["classification"] = "Class II"
+            # Invalid classification is deliberately NOT auto-remediated: hazard class is a regulatory
+            # determination, so the operator must patch it from the FDA notice via the JSON editor.
 
         # Load existing primary keys in fact_recalls to preserve uniqueness check
         existing_pks: set = set()
@@ -125,6 +127,7 @@ class QuarantineReprocessor:
             candidate_payload["dq_status"] = new_status
             candidate_payload["dq_flags"] = ", ".join(warn_flags) if warn_flags else "NONE"
             candidate_payload["validator_version"] = VALIDATOR_VERSION
+            candidate_payload["is_remediated"] = True
 
             fact_row, product_row = transformer.transform_single_record(candidate_payload)
             root_cause_assigned = fact_row["root_cause_category"]
@@ -165,6 +168,7 @@ class QuarantineReprocessor:
         audit_entry = {
             "attempt_id": attempt_id,
             "quarantine_id": quarantine_id,
+            "record_fingerprint": record_fingerprint(original_payload),
             "original_recall_number": str(q_row["recall_number"]),
             "effective_recall_number": str(candidate_payload.get("recall_number", "")),
             "reprocessed_at": now_iso,
@@ -192,3 +196,62 @@ class QuarantineReprocessor:
         updated_audit.to_parquet(self.audit_log_path, index=False)
 
         return audit_entry
+
+    def load_promoted_remediations(self) -> Dict[str, Dict[str, Any]]:
+        """
+        Returns {record_fingerprint: patched_payload} for the latest promoted attempt per record.
+        `etl.py` replays these on every run so operator remediations survive a full rebuild.
+        Attempts logged before fingerprints existed cannot be matched safely and are skipped.
+        """
+        audit = self.get_audit_log()
+        if audit.empty or "record_fingerprint" not in audit.columns:
+            return {}
+        promoted = audit[audit["promoted_to_analytical_layer"].astype(bool)].sort_values("reprocessed_at")
+        remediations: Dict[str, Dict[str, Any]] = {}
+        for _, row in promoted.iterrows():
+            fingerprint = row["record_fingerprint"]
+            if isinstance(fingerprint, str) and fingerprint:
+                remediations[fingerprint] = json.loads(row["patched_json_payload"])
+        return remediations
+
+
+def replay_remediations(
+    valid_records: List[Dict[str, Any]],
+    quarantined_df: pd.DataFrame,
+    remediations: Dict[str, Dict[str, Any]],
+    validator: DataQualityValidator,
+) -> Tuple[List[Dict[str, Any]], pd.DataFrame, int]:
+    """
+    Re-applies previously promoted operator remediations during a full ETL rebuild.
+
+    Only records quarantined again in this run (matched by raw-record fingerprint) are replayed,
+    so a record the FDA has since corrected upstream is not double-counted. Each patched payload is
+    re-validated with the current rules; quarantine rows stay in place, flagged `remediated`.
+    """
+    if quarantined_df.empty:
+        return valid_records, quarantined_df, 0
+
+    quarantined_df = quarantined_df.copy()
+    quarantined_df["remediated"] = quarantined_df["record_fingerprint"].isin(remediations.keys())
+    seen_pks = {str(r.get("recall_number", "")).strip() for r in valid_records}
+    replayed = 0
+    for fingerprint in quarantined_df.loc[quarantined_df["remediated"], "record_fingerprint"]:
+        payload = {
+            k: v
+            for k, v in remediations[fingerprint].items()
+            if k not in ("dq_status", "dq_flags", "validator_version", "is_remediated")
+        }
+        status, critical, warns = validator.evaluate_single_record(payload, seen_pks)
+        if status == "QUARANTINE":
+            logger.warning("Stored remediation %s no longer passes validation: %s", fingerprint[:12], critical)
+            quarantined_df.loc[quarantined_df["record_fingerprint"] == fingerprint, "remediated"] = False
+            continue
+        payload.update(
+            dq_status=status,
+            dq_flags=", ".join(warns) if warns else "NONE",
+            validator_version=validator.version,
+            is_remediated=True,
+        )
+        valid_records.append(payload)
+        replayed += 1
+    return valid_records, quarantined_df, replayed

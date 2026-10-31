@@ -71,7 +71,7 @@ class KeywordRuleClassifier(BaseRootCauseClassifier):
     multi-defect detection, and explicit heuristic confidence tiers.
     """
 
-    VERSION = "v1.2.0-heuristic"
+    VERSION = "v1.3.0-heuristic"
     METHOD = "deterministic_weighted_keyword_heuristic"
 
     # Minimum heuristic thresholds
@@ -96,7 +96,8 @@ class KeywordRuleClassifier(BaseRootCauseClassifier):
             (r"\bdegradation\b", 0.40),
             (r"\bbenzene\b", 0.65),
             (r"\bcross-contamination\b|\bcross contamination\b", 0.50),
-            (r"\bheavy metal\b|\blead\b|\barsenic\b", 0.50),
+            # "lead" as the element only, not the verb ("can lead to leakage")
+            (r"\bheavy metal\b|\blead\b(?!\s+to\b)|\barsenic\b", 0.50),
         ],
         "Particulate Matter & Foreign Material": [
             (r"\bparticulate matter\b|\bparticulates\b|\bparticulate\b", 0.55),

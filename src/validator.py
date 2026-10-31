@@ -1,12 +1,13 @@
 """Data Quality validation framework with PASS, WARN, and QUARANTINE outcomes."""
 from datetime import datetime, timezone
+import hashlib
 import json
 from typing import Any, Dict, List, Tuple
 import pandas as pd
 
 from src.config import EXPECTED_REQUIRED_FIELDS, VALID_CLASSIFICATIONS, VALID_STATUSES
 
-VALIDATOR_VERSION = "v1.2.0"
+VALIDATOR_VERSION = "v1.3.0"
 
 # Formal validation contract catalog surfaced in the Quarantine & Reprocessing Inspector
 VALIDATION_RULE_CATALOG: Dict[str, Dict[str, str]] = {
@@ -14,7 +15,7 @@ VALIDATION_RULE_CATALOG: Dict[str, Dict[str, str]] = {
         "severity": "QUARANTINE",
         "failure_reason": "Primary identifier `recall_number` is null, empty, or whitespace.",
         "expected_condition": "`recall_number` must be a non-empty string uniquely identifying the recall enforcement record.",
-        "remediation_guide": "Populate `recall_number` from `event_id` + product sequence or assign a synthetic tracking key.",
+        "remediation_guide": "Auto-remediation assigns a synthetic key from `event_id` + record index; or patch the real `recall_number` from the FDA notice.",
     },
     "CRITICAL_DUPLICATE_PRIMARY_KEY": {
         "severity": "QUARANTINE",
@@ -26,7 +27,7 @@ VALIDATION_RULE_CATALOG: Dict[str, Dict[str, str]] = {
         "severity": "QUARANTINE",
         "failure_reason": "`classification` is missing or outside FDA enforcement severity classes.",
         "expected_condition": "`classification` must be strictly one of: ['Class I', 'Class II', 'Class III'].",
-        "remediation_guide": "Assign a valid FDA classification ('Class I', 'Class II', or 'Class III') after reviewing recall notice.",
+        "remediation_guide": "Manual only: look up the FDA recall notice and patch `classification` in the JSON editor. Never defaulted automatically.",
     },
     "CRITICAL_UNPARSEABLE_REPORT_DATE": {
         "severity": "QUARANTINE",
@@ -38,7 +39,7 @@ VALIDATION_RULE_CATALOG: Dict[str, Dict[str, str]] = {
         "severity": "QUARANTINE",
         "failure_reason": "`report_date` occurs earlier than `recall_initiation_date` (negative reporting lag) or year < 1990.",
         "expected_condition": "`recall_initiation_date <= report_date` and `recall_initiation_date >= 19900101`.",
-        "remediation_guide": "Align `recall_initiation_date` and `report_date` so initiation precedes or equals the FDA report date.",
+        "remediation_guide": "Auto-remediation clears the untrustworthy `recall_initiation_date` (record is kept with a WARN and no lag); or patch the true date manually.",
     },
     "WARN_MISSING_OPENFDA_PRODUCT_IDS": {
         "severity": "WARN",
@@ -67,6 +68,33 @@ VALIDATION_RULE_CATALOG: Dict[str, Dict[str, str]] = {
 }
 
 
+def _clean_str(value: Any) -> str:
+    """Stringifies a raw field, treating JSON null as empty (so null never becomes the string 'None')."""
+    return "" if value is None else str(value).strip()
+
+
+def record_fingerprint(record: Dict[str, Any]) -> str:
+    """Stable SHA-256 of a raw record, used to recognise the same quarantined record across ETL runs."""
+    return hashlib.sha256(json.dumps(record, sort_keys=True).encode("utf-8")).hexdigest()
+
+
+def check_schema_consistency(raw_records: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Checks that every raw record carries each required field as a string (or null)."""
+    missing_key_fields: Dict[str, int] = {}
+    wrong_type_fields: Dict[str, int] = {}
+    for record in raw_records:
+        for field_name in EXPECTED_REQUIRED_FIELDS:
+            if field_name not in record:
+                missing_key_fields[field_name] = missing_key_fields.get(field_name, 0) + 1
+            elif record[field_name] is not None and not isinstance(record[field_name], str):
+                wrong_type_fields[field_name] = wrong_type_fields.get(field_name, 0) + 1
+    return {
+        "schema_consistency_passed": not missing_key_fields and not wrong_type_fields,
+        "schema_missing_key_fields": json.dumps(missing_key_fields),
+        "schema_wrong_type_fields": json.dumps(wrong_type_fields),
+    }
+
+
 class DataQualityValidator:
     """Validates raw OpenFDA records and checks post-transform referential integrity."""
 
@@ -93,10 +121,9 @@ class DataQualityValidator:
         """
         critical_reasons: List[str] = []
         warn_reasons: List[str] = []
-        # now_ts = pd.Timestamp(datetime.utcnow().date())  # <-- DEPRECATED
-        now_ts = pd.Timestamp(datetime.now(timezone.utc).date())  # <-- TIMEZONE-AWARE UTC
+        now_ts = pd.Timestamp(datetime.now(timezone.utc).date())
 
-        recall_num = str(record.get("recall_number", "")).strip()
+        recall_num = _clean_str(record.get("recall_number"))
         if not recall_num:
             critical_reasons.append("CRITICAL_MISSING_RECALL_NUMBER")
         elif not allow_existing_pk and recall_num in seen_pks:
@@ -104,7 +131,7 @@ class DataQualityValidator:
         else:
             seen_pks.add(recall_num)
 
-        classification = str(record.get("classification", "")).strip()
+        classification = _clean_str(record.get("classification"))
         if classification not in VALID_CLASSIFICATIONS:
             critical_reasons.append("CRITICAL_INVALID_CLASSIFICATION")
 
@@ -114,21 +141,21 @@ class DataQualityValidator:
         if pd.isna(report_dt) or report_dt > now_ts:
             critical_reasons.append("CRITICAL_UNPARSEABLE_REPORT_DATE")
 
-        if pd.notna(report_dt) and pd.notna(init_dt):
-            lag_days = (report_dt - init_dt).days
-            if init_dt.year < 1990 or init_dt > now_ts or lag_days < 0:
-                critical_reasons.append("CRITICAL_CHRONOLOGICAL_INVERSION")
-        else:
+        if pd.isna(init_dt):
             warn_reasons.append("WARN_MISSING_INITIATION_DATE")
+        elif init_dt.year < 1990 or init_dt > now_ts:
+            critical_reasons.append("CRITICAL_CHRONOLOGICAL_INVERSION")
+        elif pd.notna(report_dt) and (report_dt - init_dt).days < 0:
+            critical_reasons.append("CRITICAL_CHRONOLOGICAL_INVERSION")
 
         openfda = record.get("openfda") or {}
         if not bool(openfda.get("product_ndc") or openfda.get("brand_name")):
             warn_reasons.append("WARN_MISSING_OPENFDA_PRODUCT_IDS")
 
-        if not str(record.get("state", "")).strip():
+        if not _clean_str(record.get("state")):
             warn_reasons.append("WARN_MISSING_GEOGRAPHIC_STATE")
 
-        if str(record.get("status", "")).strip() not in VALID_STATUSES:
+        if _clean_str(record.get("status")) not in VALID_STATUSES:
             warn_reasons.append("WARN_UNEXPECTED_STATUS_VALUE")
 
         if critical_reasons:
@@ -156,7 +183,7 @@ class DataQualityValidator:
             for w_rule in warn_list:
                 rule_counts[w_rule] = rule_counts.get(w_rule, 0) + 1
 
-            recall_num = str(record.get("recall_number", "")).strip() or f"MISSING_PK_ROW_{idx}"
+            recall_num = _clean_str(record.get("recall_number")) or f"MISSING_PK_ROW_{idx}"
 
             if status == "QUARANTINE":
                 quarantine_id = f"Q_{self.run_id}_{idx}"
@@ -187,6 +214,7 @@ class DataQualityValidator:
                         "failure_explanations_json": json.dumps(failure_details),
                         "warn_flags": ", ".join(warn_list) if warn_list else "NONE",
                         "raw_json_payload": json.dumps(record),
+                        "record_fingerprint": record_fingerprint(record),
                     }
                 )
             else:
@@ -246,7 +274,7 @@ class DataQualityValidator:
             "records_quarantined": quarantine_count,
             "duplicate_count": rule_counts["CRITICAL_DUPLICATE_PRIMARY_KEY"],
             "chronological_anomaly_count": rule_counts["CRITICAL_CHRONOLOGICAL_INVERSION"],
-            "schema_consistency_passed": True,
+            **check_schema_consistency(raw_records),
         }
 
         return (
@@ -261,14 +289,29 @@ class DataQualityValidator:
     def verify_referential_integrity(
         fact_recalls: pd.DataFrame, dim_firms: pd.DataFrame, dim_products: pd.DataFrame
     ) -> Dict[str, Any]:
-        """Verifies foreign key integrity between fact_recalls and dimension tables."""
+        """
+        Verifies primary-key uniqueness and foreign-key integrity across the star schema.
+        Guards against regressions in transforms and against offline reprocessing promotions.
+        """
         if fact_recalls.empty:
-            return {"orphan_firm_fks": 0, "orphan_product_fks": 0, "referential_integrity_passed": True}
+            return {
+                "orphan_firm_fks": 0,
+                "orphan_product_fks": 0,
+                "duplicate_fact_pks": 0,
+                "duplicate_firm_pks": 0,
+                "referential_integrity_passed": True,
+            }
 
         orphan_firms = int((~fact_recalls["firm_id"].isin(dim_firms["firm_id"])).sum())
         orphan_products = int((~fact_recalls["recall_number"].isin(dim_products["recall_number"])).sum())
+        duplicate_fact_pks = int(fact_recalls["recall_number"].duplicated().sum())
+        duplicate_firm_pks = int(dim_firms["firm_id"].duplicated().sum())
         return {
             "orphan_firm_fks": orphan_firms,
             "orphan_product_fks": orphan_products,
-            "referential_integrity_passed": (orphan_firms == 0 and orphan_products == 0),
+            "duplicate_fact_pks": duplicate_fact_pks,
+            "duplicate_firm_pks": duplicate_firm_pks,
+            "referential_integrity_passed": (
+                orphan_firms == 0 and orphan_products == 0 and duplicate_fact_pks == 0 and duplicate_firm_pks == 0
+            ),
         }

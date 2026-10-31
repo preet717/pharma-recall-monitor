@@ -1,5 +1,6 @@
 """Configuration and extensible endpoint registry for the OpenFDA pipeline."""
-from dataclasses import dataclass, field
+from dataclasses import dataclass
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Dict, List
 
@@ -8,6 +9,19 @@ RAW_DATA_DIR = BASE_DIR / "data" / "raw"
 PROCESSED_DATA_DIR = BASE_DIR / "data" / "processed"
 CHECKPOINT_FILE = RAW_DATA_DIR / "_checkpoint.json"
 
+WINDOW_MONTHS = 36
+
+
+def rolling_window(months: int = WINDOW_MONTHS, today: date | None = None) -> tuple[str, str]:
+    """Returns (start, end) as YYYYMMDD: the first day of the month `months` back, through today (UTC)."""
+    today = today or datetime.now(timezone.utc).date()
+    month_index = today.year * 12 + (today.month - 1) - (months - 1)
+    start = date(month_index // 12, month_index % 12 + 1, 1)
+    return start.strftime("%Y%m%d"), today.strftime("%Y%m%d")
+
+
+WINDOW_START, WINDOW_END = rolling_window()
+
 
 @dataclass(frozen=True)
 class EndpointConfig:
@@ -15,8 +29,8 @@ class EndpointConfig:
     enforcement_url: str
     adverse_event_url: str
     date_field: str = "report_date"
-    start_date: str = "20231101"  # 36-month window: Nov 2023 - Oct 2026
-    end_date: str = "20261031"
+    start_date: str = WINDOW_START  # Rolling 36-month window ending today
+    end_date: str = WINDOW_END
     page_limit: int = 1000
     max_pages: int = 10           # Up to 10,000 records per run
 

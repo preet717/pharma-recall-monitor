@@ -1,6 +1,8 @@
-requests>=2.31.0
-pandas>=2.1.0
-pyarrow>=14.0.0
-streamlit>=1.32.0
-plotly>=5.19.0
-pytest>=8.0.0
+# Tested with Python 3.13; compatible ranges keep a fresh install reproducible without blocking patches.
+requests>=2.31,<3
+numpy>=1.26,<3
+pandas>=2.1,<4
+pyarrow>=14,<27
+streamlit>=1.50,<2
+plotly>=5.19,<8
+pytest>=8,<9

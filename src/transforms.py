@@ -10,20 +10,6 @@ from src.config import SEVERITY_WEIGHTS
 from src.validator import VALIDATOR_VERSION
 
 
-# def normalize_firm_name(name: Any) -> str:
-#     """Standardizes manufacturer names for deterministic entity resolution."""
-#     if not name or not str(name).strip():
-#         return "UNKNOWN MANUFACTURER"
-#     cleaned = str(name).upper().strip()
-#     cleaned = re.sub(r"[,\.\(\)]", " ", cleaned)
-#     cleaned = re.sub(
-#         r"\b(INC|INCORPORATED|LLC|LTD|LIMITED|CORP|CORPORATION|CO|COMPANY|PHARMACEUTICALS|PHARMA|LABS|LABORATORIES)\b",
-#         "",
-#         cleaned,
-#     )
-#     cleaned = re.sub(r"\s+", " ", cleaned).strip()
-#     return cleaned if cleaned else str(name).upper().strip()
-
 def normalize_firm_name(name: Any) -> str:
     """Standardizes manufacturer names across enforcement and FAERS endpoints."""
     if not name or not str(name).strip():
@@ -129,6 +115,7 @@ class RecallTransformer:
             "reliable_product_key": reliable_product_key,
             "dq_status": r.get("dq_status", "PASS"),
             "dq_flags": r.get("dq_flags", "NONE"),
+            "is_remediated": bool(r.get("is_remediated", False)),
             "openfda_mfr_clean": openfda_mfr_clean,
         }
 
@@ -164,7 +151,9 @@ class RecallTransformer:
             c2_count = int((grp["classification"] == "Class II").sum())
             c3_count = int((grp["classification"] == "Class III").sum())
 
-            severity_score = (c1_count * 10) + (c2_count * 5) + (c3_count * 1)
+            # Total score measures exposure (grows with volume); the per-recall average measures intensity
+            severity_score = int(grp["severity_weight"].sum())
+            avg_severity = round(severity_score / total_recalls, 2)
             c1_pct = round((c1_count / total_recalls) * 100.0, 2)
 
             valid_products = grp.loc[grp["has_reliable_product_id"], "reliable_product_key"].dropna().unique()
@@ -187,20 +176,22 @@ class RecallTransformer:
                 {
                     "firm_id": firm_id,
                     "firm_name_clean": clean_name,
+                    # Most common raw name: readable label, since the cleaned key can be terse (e.g. "SUN")
+                    "firm_display_name": grp["recalling_firm_raw"].mode().iloc[0],
                     "primary_state": grp["state"].mode().iloc[0] if not grp["state"].mode().empty else "Unknown",
-                    "primary_country": grp["country"].mode().iloc[0] if not grp["country"].mode().empty else "US",
+                    "primary_country": grp["country"].mode().iloc[0] if not grp["country"].mode().empty else "United States",
                     "total_recalls": total_recalls,
                     "class_i_recalls": c1_count,
                     "class_ii_recalls": c2_count,
                     "class_iii_recalls": c3_count,
                     "class_i_pct": c1_pct,
                     "severity_weighted_score": severity_score,
+                    "avg_severity_per_recall": avg_severity,
                     "distinct_identified_products": distinct_products,
                     "recalls_per_product": recalls_per_product,
                     "median_reporting_lag_days": float(grp["reporting_lag_days"].median())
                     if grp["reporting_lag_days"].notna().any()
                     else np.nan,
-                    # "contextual_adverse_event_count": ae_map.get(clean_name, 0),
                     "contextual_adverse_event_count": ae_total,
                 }
             )

@@ -7,15 +7,22 @@ import pandas as pd
 import plotly.express as px
 import streamlit as st
 
+from src.analytics import build_insights, firm_scorecard
 from src.config import PROCESSED_DATA_DIR
 from src.reprocessor import QuarantineReprocessor
-from src.validator import VALIDATION_RULE_CATALOG
 
 st.set_page_config(
     page_title="OpenFDA Pharma Recall & Compliance Monitor",
     page_icon="🛡️",
     layout="wide",
 )
+
+CONFIDENCE_LABELS = {
+    "HIGH_CONFIDENCE": "High confidence",
+    "MODERATE_CONFIDENCE": "Moderate confidence",
+    "LOW_CONFIDENCE": "Low confidence (review)",
+    "UNCLASSIFIED": "Unclassified (no keyword match)",
+}
 
 
 @st.cache_data(ttl=15)
@@ -40,8 +47,8 @@ def load_parquet_tables():
 def main():
     st.title("🛡️ OpenFDA Drug Recall & Regulatory Compliance Intelligence")
     st.caption(
-        "End-to-End Star Schema Analytics, Explainable Heuristic Defect Classification, "
-        "and Offline Quarantine Reprocessing Platform (36-Month Enforcement Window)"
+        "Which drug recalls are happening, why, and which manufacturers carry the most regulatory risk: "
+        "FDA enforcement reports over a rolling 36-month window, with data-quality checks you can inspect."
     )
 
     tables = load_parquet_tables()
@@ -60,7 +67,18 @@ def main():
         st.stop()
 
     # Global Sidebar Filters
-    st.sidebar.header("🔎 Global Analytical Filters")
+    st.sidebar.header("🔎 Filters")
+    min_date = fact_df["report_date"].min().date()
+    max_date = fact_df["report_date"].max().date()
+    date_range = st.sidebar.date_input(
+        "FDA Report Date Range",
+        value=(min_date, max_date),
+        min_value=min_date,
+        max_value=max_date,
+    )
+    # While the user is mid-selection Streamlit returns a single date
+    start_date, end_date = date_range if len(date_range) == 2 else (date_range[0], max_date)
+    firm_query = st.sidebar.text_input("Search Recalling Firm", placeholder="e.g. Cardinal, Sun Pharma")
     selected_classes = st.sidebar.multiselect(
         "Hazard Classification",
         options=["Class I", "Class II", "Class III"],
@@ -77,17 +95,31 @@ def main():
         default=["PASS", "WARN"],
     )
     confidence_filter = st.sidebar.multiselect(
-        "Heuristic Confidence Tier",
-        options=["HIGH_CONFIDENCE", "MODERATE_CONFIDENCE", "LOW_CONFIDENCE", "UNCLASSIFIED"],
-        default=["HIGH_CONFIDENCE", "MODERATE_CONFIDENCE", "LOW_CONFIDENCE", "UNCLASSIFIED"],
+        "Root-Cause Confidence",
+        options=list(CONFIDENCE_LABELS),
+        default=list(CONFIDENCE_LABELS),
+        format_func=CONFIDENCE_LABELS.get,
     )
 
     filtered_fact = fact_df[
-        (fact_df["classification"].isin(selected_classes))
+        (fact_df["report_date"].dt.date.between(start_date, end_date))
+        & (fact_df["classification"].isin(selected_classes))
         & (fact_df["status"].isin(selected_statuses))
         & (fact_df["dq_status"].isin(selected_dq_tiers))
         & (fact_df["confidence_tier"].isin(confidence_filter))
     ].copy()
+    if firm_query.strip():
+        filtered_fact = filtered_fact[
+            filtered_fact["recalling_firm_raw"].str.contains(firm_query.strip(), case=False, regex=False, na=False)
+        ]
+
+    st.sidebar.caption(f"{len(filtered_fact):,} of {len(fact_df):,} recalls match the filters.")
+    st.sidebar.download_button(
+        "⬇️ Download Filtered Recalls (CSV)",
+        data=filtered_fact.drop(columns=["competing_category_scores"]).to_csv(index=False).encode("utf-8"),
+        file_name="filtered_recalls.csv",
+        mime="text/csv",
+    )
 
     tabs = st.tabs(
         [
@@ -114,11 +146,15 @@ def main():
         multi_defect_pct = round((filtered_fact["is_multi_defect"].mean() * 100), 1) if total_recalls else 0.0
 
         k1, k2, k3, k4, k5 = st.columns(5)
-        k1.metric("Active Analytical Recalls", f"{total_recalls:,}")
-        k2.metric("Class I (Life-Threatening)", f"{c1_count:,}", f"{c1_pct}% of total")
-        k3.metric("Median Reporting Lag", f"{median_lag} days")
+        k1.metric("Recalls in Scope", f"{total_recalls:,}")
+        k2.metric("Class I (Most Serious)", f"{c1_count:,}", f"{c1_pct}% of total", delta_color="off")
+        k3.metric("Median Initiation → FDA Report", f"{median_lag} days")
         k4.metric("Multi-Defect Recalls", f"{multi_defect_pct}%")
         k5.metric("Quarantined Records", f"{len(quarantine_df):,}")
+
+        st.markdown("#### 💡 Key Findings")
+        for insight in build_insights(filtered_fact):
+            st.markdown(f"- {insight}")
 
         col_left, col_right = st.columns(2)
         with col_left:
@@ -136,7 +172,7 @@ def main():
                 title="Monthly Recall Enforcement Volume by Hazard Class",
                 color_discrete_map={"Class I": "#d62728", "Class II": "#ff7f0e", "Class III": "#1f77b4"},
             )
-            st.plotly_chart(fig_trend, use_container_width=True)
+            st.plotly_chart(fig_trend, width="stretch")
 
         with col_right:
             rc_summary = (
@@ -153,7 +189,7 @@ def main():
                 title="Root-Cause Defect Taxonomy by Hazard Class",
                 color_discrete_map={"Class I": "#d62728", "Class II": "#ff7f0e", "Class III": "#1f77b4"},
             )
-            st.plotly_chart(fig_rc, use_container_width=True)
+            st.plotly_chart(fig_rc, width="stretch")
 
     # =========================================================================
     # TAB 2: EXPLAINABLE ROOT-CAUSE INTELLIGENCE
@@ -181,7 +217,7 @@ def main():
                 color="root_cause_category",
                 title="Distribution of Heuristic Confidence Tiers Across Categories",
             )
-            st.plotly_chart(fig_conf, use_container_width=True)
+            st.plotly_chart(fig_conf, width="stretch")
 
         with c_right:
             fig_hist = px.histogram(
@@ -191,7 +227,7 @@ def main():
                 nbins=20,
                 title="Uncalibrated Heuristic Score Distribution by Confidence Tier",
             )
-            st.plotly_chart(fig_hist, use_container_width=True)
+            st.plotly_chart(fig_hist, width="stretch")
 
         st.markdown("#### 🔬 Audit Individual Classification Explanations & Competing Category Scores")
         tier_focus = st.selectbox(
@@ -220,7 +256,7 @@ def main():
                     "classifier_version",
                 ]
             ],
-            use_container_width=True,
+            width="stretch",
             hide_index=True,
         )
 
@@ -230,60 +266,98 @@ def main():
     with tabs[2]:
         st.subheader("Manufacturer Regulatory Risk Scorecard")
         st.caption(
-            "**Risk Scoring Formula:** `Severity Weighted Score = (Class I × 10) + (Class II × 5) + (Class III × 1)`. "
-            "`Recalls per Product` is computed strictly where reliable NDC/brand identifiers exist. "
-            "`Contextual Adverse Events` are displayed separately as market-volume context and are NOT evidence of recall causation."
+            "**Exposure** = (Class I × 10) + (Class II × 5) + (Class III × 1); it grows with recall volume. "
+            "**Intensity** = exposure ÷ total recalls (1–10); it shows how serious a firm's recalls typically are, "
+            "regardless of size. Scores follow the sidebar filters. Recalls per product only counts recalls with an "
+            "NDC or brand identifier. Adverse-event counts are whole-window market context, not evidence of causation."
         )
 
-        min_recalls = st.slider("Minimum Total Recalls per Firm", min_value=1, max_value=20, value=2)
-        scored_firms = firms_df[firms_df["total_recalls"] >= min_recalls].copy()
-
-        col_scatter, col_top = st.columns(2)
-        with col_scatter:
-            fig_firms = px.scatter(
-                scored_firms.head(60),
-                x="total_recalls",
-                y="severity_weighted_score",
-                size="class_i_pct",
-                color="primary_state",
-                hover_name="firm_name_clean",
-                hover_data=["class_i_recalls", "recalls_per_product", "contextual_adverse_event_count"],
-                title="Top Manufacturers: Total Recalls vs. Severity-Weighted Score (Size = Class I %)",
-            )
-            st.plotly_chart(fig_firms, use_container_width=True)
-
-        with col_top:
-            top15 = scored_firms.head(15).sort_values("severity_weighted_score", ascending=True)
-            fig_bar = px.bar(
-                top15,
-                x="severity_weighted_score",
-                y="firm_name_clean",
-                color="class_i_pct",
-                orientation="h",
-                title="Top 15 Firms by Severity-Weighted Recall Score",
-                color_continuous_scale="Reds",
-            )
-            st.plotly_chart(fig_bar, use_container_width=True)
-
-        st.dataframe(
-            scored_firms[
-                [
-                    "firm_name_clean",
-                    "primary_state",
-                    "primary_country",
-                    "severity_weighted_score",
-                    "total_recalls",
-                    "class_i_recalls",
-                    "class_i_pct",
-                    "distinct_identified_products",
-                    "recalls_per_product",
-                    "median_reporting_lag_days",
-                    "contextual_adverse_event_count",
-                ]
-            ],
-            use_container_width=True,
-            hide_index=True,
+        sc1, sc2 = st.columns(2)
+        min_recalls = sc1.slider("Minimum Total Recalls per Firm", min_value=1, max_value=20, value=2)
+        rank_by = sc2.radio(
+            "Rank Firms By",
+            options=["severity_weighted_score", "avg_severity_per_recall"],
+            format_func=lambda x: "Exposure (total severity)" if x == "severity_weighted_score" else "Intensity (avg severity per recall)",
+            horizontal=True,
         )
+        scorecard = firm_scorecard(filtered_fact, firms_df)
+        if scorecard.empty:
+            st.info("No recalls match the current filters.")
+        else:
+            scored_firms = (
+                scorecard[scorecard["total_recalls"] >= min_recalls]
+                .sort_values([rank_by, "total_recalls"], ascending=False)
+            )
+
+            col_scatter, col_top = st.columns(2)
+            with col_scatter:
+                fig_firms = px.scatter(
+                    scored_firms.head(60),
+                    x="total_recalls",
+                    y="avg_severity_per_recall",
+                    size="severity_weighted_score",
+                    color="class_i_pct",
+                    color_continuous_scale="Reds",
+                    hover_name="firm_display_name",
+                    hover_data=["class_i_recalls", "recalls_per_product", "contextual_adverse_event_count"],
+                    labels={
+                        "total_recalls": "Total recalls",
+                        "avg_severity_per_recall": "Intensity (avg severity)",
+                        "class_i_pct": "Class I %",
+                    },
+                    title="Volume vs. Intensity (bubble size = exposure; top-right = highest concern)",
+                )
+                st.plotly_chart(fig_firms, width="stretch")
+
+            with col_top:
+                top15 = scored_firms.head(15).sort_values(rank_by, ascending=True)
+                fig_bar = px.bar(
+                    top15,
+                    x=rank_by,
+                    y="firm_display_name",
+                    color="class_i_pct",
+                    orientation="h",
+                    labels={rank_by: "Score", "firm_display_name": "", "class_i_pct": "Class I %"},
+                    title="Top 15 Firms by Selected Ranking",
+                    color_continuous_scale="Reds",
+                )
+                st.plotly_chart(fig_bar, width="stretch")
+
+            st.dataframe(
+                scored_firms[
+                    [
+                        "firm_display_name",
+                        "primary_state",
+                        "primary_country",
+                        "severity_weighted_score",
+                        "avg_severity_per_recall",
+                        "total_recalls",
+                        "class_i_recalls",
+                        "class_i_pct",
+                        "distinct_identified_products",
+                        "recalls_per_product",
+                        "median_reporting_lag_days",
+                        "contextual_adverse_event_count",
+                    ]
+                ].rename(
+                    columns={
+                        "firm_display_name": "Firm",
+                        "primary_state": "State",
+                        "primary_country": "Country",
+                        "severity_weighted_score": "Exposure",
+                        "avg_severity_per_recall": "Intensity",
+                        "total_recalls": "Recalls",
+                        "class_i_recalls": "Class I",
+                        "class_i_pct": "Class I %",
+                        "distinct_identified_products": "Identified Products",
+                        "recalls_per_product": "Recalls / Product",
+                        "median_reporting_lag_days": "Median Lag (days)",
+                        "contextual_adverse_event_count": "Adverse-Event Reports (context)",
+                    }
+                ),
+                width="stretch",
+                hide_index=True,
+            )
 
     # =========================================================================
     # TAB 4: QUARANTINE & REPROCESSING INSPECTOR
@@ -323,9 +397,12 @@ def main():
                 )
             ].copy()
 
-            # Annotate whether a quarantine_id has already been reprocessed
-            reprocessed_ids = set(audit_df["quarantine_id"].unique()) if not audit_df.empty else set()
-            filtered_q["reprocessed_in_audit_log"] = filtered_q["quarantine_id"].isin(reprocessed_ids)
+            # Annotate whether a record has already been reprocessed. Quarantine IDs change on every ETL run,
+            # so match on the stable raw-record fingerprint where both sides have it.
+            reprocessed = filtered_q["quarantine_id"].isin(set(audit_df["quarantine_id"])) if not audit_df.empty else False
+            if not audit_df.empty and "record_fingerprint" in audit_df and "record_fingerprint" in filtered_q:
+                reprocessed = reprocessed | filtered_q["record_fingerprint"].isin(set(audit_df["record_fingerprint"].dropna()))
+            filtered_q["reprocessed_in_audit_log"] = reprocessed
 
             st.markdown(f"**Quarantined Records Matching Filter ({len(filtered_q)} rows):**")
             st.dataframe(
@@ -344,7 +421,7 @@ def main():
                         "validator_version",
                     ]
                 ],
-                use_container_width=True,
+                width="stretch",
                 hide_index=True,
             )
 
@@ -377,7 +454,7 @@ def main():
                             "manual_json_patch",
                         ],
                         format_func=lambda x: (
-                            "Automated Remediation (Disambiguate duplicate PK / align inverted dates)"
+                            "Automated Remediation (synthetic key for missing/duplicate PK; clear inverted initiation date)"
                             if x == "auto_remediate_known_anomalies"
                             else "Apply Custom Operator Edits from JSON Editor"
                         ),
@@ -433,7 +510,7 @@ def main():
         if latest_audit.empty:
             st.info("No reprocessing attempts logged yet. Select a quarantined record above to test reprocessing.")
         else:
-            st.dataframe(latest_audit.sort_values("reprocessed_at", ascending=False), use_container_width=True, hide_index=True)
+            st.dataframe(latest_audit.sort_values("reprocessed_at", ascending=False), width="stretch", hide_index=True)
 
     # =========================================================================
     # TAB 5: DATA QUALITY & PIPELINE LINEAGE
@@ -453,7 +530,7 @@ def main():
         c1, c2 = st.columns(2)
         with c1:
             st.markdown("##### Validation Rule Outcomes (`dq_rule_summary.parquet`)")
-            st.dataframe(dq_rules_df, use_container_width=True, hide_index=True)
+            st.dataframe(dq_rules_df, width="stretch", hide_index=True)
         with c2:
             st.markdown("##### Field-Level Completeness (`dq_field_completeness.parquet`)")
             fig_comp = px.bar(
@@ -463,10 +540,10 @@ def main():
                 orientation="h",
                 title="Field Completeness (%) Across Extracted Raw Records",
             )
-            st.plotly_chart(fig_comp, use_container_width=True)
+            st.plotly_chart(fig_comp, width="stretch")
 
         st.markdown("##### Execution Lineage History (`pipeline_lineage.parquet`)")
-        st.dataframe(lineage_df.sort_values("extraction_timestamp", ascending=False), use_container_width=True, hide_index=True)
+        st.dataframe(lineage_df.sort_values("extraction_timestamp", ascending=False), width="stretch", hide_index=True)
 
 
 if __name__ == "__main__":
